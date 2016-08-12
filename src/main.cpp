@@ -3,29 +3,20 @@
 #include <zlib.h>
 #include <map>
 #include <vector>
-
+#include <math.h>
 #include <chrono>
 #include <ctime>
 #include "../headers/fileformat.pb.h"
 #include "../headers/osmformat.pb.h"
+#include "../headers/osmParser.h"
 using namespace std;
 
-typedef struct
-{
-	int id;
-	double lat;
-	double lon;
-	vector<int> adj;
-} node_t;
 
-bool processDataBlock( map< int, node_t > &mapData, OSMPBF::Blob* );
-bool processHeaderBlock( OSMPBF::Blob* );
-void inflateData( OSMPBF::Blob* b, unsigned char* test );
-void processDenseNodes( map< int, node_t > &mapData, OSMPBF::PrimitiveBlock* pb, int i );
-void processWays( map< int, node_t > &mapData, OSMPBF::PrimitiveBlock* pb, int i );
-
-int adjTotal = 0;
-
+/*-------------------------------------------
+main()
+Handles opening the file and passing it to child
+functions for parsing and data storage
+--------------------------------------------*/
 int main( int argc, char* argv[] )
 {
     //error checking
@@ -43,9 +34,8 @@ int main( int argc, char* argv[] )
     OSMPBF::BlobHeader blobHeader;
     OSMPBF::Blob blob;
     int i = 0;
-	
-	map< int, node_t > mapData;
-	
+	map< nodeId_t, node_t > fullData;
+	map<nodeId_t, node_t> reducedData;
 	chrono::duration<double> time;
 	chrono::time_point<chrono::system_clock> start, end;
 	
@@ -60,7 +50,6 @@ int main( int argc, char* argv[] )
 		}    
 
         headerLen = __builtin_bswap32( headerLen );
-        cout << "-----------------------------------" << endl;
 
         blobHeaderBuffer = realloc( blobHeaderBuffer, headerLen );
         input.read( reinterpret_cast<char *>(blobHeaderBuffer), headerLen );
@@ -75,7 +64,7 @@ int main( int argc, char* argv[] )
 
         if( strcmp("OSMData", blobHeader.type().c_str()) == 0 )
         {
-            processDataBlock( mapData, &blob );
+            processDataBlock( fullData, &blob );
         }
         else if( strcmp("OSMHeader", blobHeader.type().c_str()) == 0 )
         {
@@ -83,20 +72,69 @@ int main( int argc, char* argv[] )
         }
     } while( 1 );
 	
+	postProcessNodes( fullData, reducedData );
+	
 	end = chrono::system_clock::now();
 	time = end - start;
 	
-	cout << "Map Size: " << mapData.size() << endl;
-	cout << "Adj Size: " << adjTotal << endl;
-	cout << "Time: " << time.count() << endl << endl;
+	cout << endl <<"Blocks: " << i << endl;
+	cout << "Map Size: " << fullData.size() / 1000 << endl;
+	cout << "Reduced Size: " << reducedData.size() / 1000 << endl;
+	cout << "Time: " << time.count() << " seconds" << endl << endl;
     input.close();
     free(blobHeaderBuffer);
     free(blobBuffer);
-
-    //cout << endl << "Blocks: " << i << endl;
 }
 
-bool processDataBlock( map< int, node_t > &mapData, OSMPBF::Blob* b )
+
+/*-------------------------------------------
+postProcessNodes()
+Reduces the data in fullData. Nodes with 2 or
+less adjacencies can be removed from the data
+as these are not intersections. Each adjacency
+gets a distance associated with it before
+throwing away the fullData
+--------------------------------------------*/
+void postProcessNodes( map<nodeId_t, node_t> &fullData, map<nodeId_t, node_t> &reducedData )
+{
+	//local variables
+	map<nodeId_t, node_t>::iterator i;
+	map<nodeId_t, node_t>::iterator j;
+	node_t n1;
+	node_t n2;
+
+	for( i = fullData.begin(); i != fullData.end(); i++)
+	{
+		if( i->second.adj.size() > 2 )
+		{
+			reducedData[i->second.id] = i->second;
+		}
+	}
+	
+	for( j = reducedData.begin(); j != reducedData.end(); j++)
+	{
+		n1 = j->second;
+
+		for(int k = 0; k < n1.adj.size(); k++)
+		{
+			n2 = fullData[ n1.adj[k].first ];
+			n1.adj[k].second = calculateDist(n1.lat, n1.lon, n2.lat, n2.lon);
+			
+		}
+	}
+
+}
+
+
+/*-------------------------------------------
+proccessDataBlock()
+Takes a blob and determines what processing
+needs to be done on it. If compressed, will
+call for decompression and then pass to
+the specific processing function for its 
+OSM type
+--------------------------------------------*/
+bool processDataBlock( map< nodeId_t, node_t > &fullData, OSMPBF::Blob* b )
 {
 	//local variables
 	OSMPBF::PrimitiveBlock pb;
@@ -124,8 +162,7 @@ bool processDataBlock( map< int, node_t > &mapData, OSMPBF::Blob* b )
 	{
 		if( pb.primitivegroup( i ).has_dense() )
 		{
-			//cout << "Has dense" << endl;
-			processDenseNodes( mapData, &pb, i );
+			processDenseNodes( fullData, &pb, i );
 		}
 		else if( pb.primitivegroup( i ).nodes_size() > 0)
 		{
@@ -134,8 +171,7 @@ bool processDataBlock( map< int, node_t > &mapData, OSMPBF::Blob* b )
 		}
 		else if( pb.primitivegroup( i ).ways_size() > 0 )
 		{
-			processWays( mapData, &pb, i);
-			//cout << "Ways: " << pb.primitivegroup( i ).ways_size() << endl;
+			processWays( fullData, &pb, i);
 		}
 	}
 	
@@ -144,7 +180,13 @@ bool processDataBlock( map< int, node_t > &mapData, OSMPBF::Blob* b )
     return true;
 }
 
-void processWays( map< int, node_t > &mapData, OSMPBF::PrimitiveBlock* pb, int i )
+/*-------------------------------------------
+processWays()
+Takes a primitive block of ways and adds the
+necessary adjacencies to the nodes. Nodes
+next to each other in a way share an adjacency
+--------------------------------------------*/
+void processWays( map< nodeId_t, node_t > &fullData, OSMPBF::PrimitiveBlock* pb, int i )
 {
 	//local variables
 	OSMPBF::PrimitiveGroup pg = pb->primitivegroup( i );
@@ -152,8 +194,10 @@ void processWays( map< int, node_t > &mapData, OSMPBF::PrimitiveBlock* pb, int i
 	int j = 0;
 	int numWays = 0;
 	int numRefs = 0;
-	int ref1;
-	int ref2;
+	nodeId_t ref1;
+	nodeId_t ref2;
+	pair<nodeId_t, dist_t> p1;
+	pair<nodeId_t, dist_t> p2;
 	
 	for(j = 0, numWays = pg.ways_size(); j < numWays; j++) 
 	{
@@ -164,23 +208,34 @@ void processWays( map< int, node_t > &mapData, OSMPBF::PrimitiveBlock* pb, int i
 		{
 			ref1 += w.refs( k );
 			ref2 += w.refs( k + 1 );
-            mapData[ ref1 ].adj.push_back( ref2 );
-			mapData[ ref2 ].adj.push_back( ref1 );
-			adjTotal += 2;
+			
+			if(ref1 != ref2)
+			{
+				p1 = make_pair( ref1, 0 );
+				p2 = make_pair( ref2, 0 );
+				fullData[ ref1 ].adj.push_back( p2 );
+				fullData[ ref2 ].adj.push_back( p1 );
+			}
         }
     }
 }
 
-void processDenseNodes( map< int, node_t > &mapData, OSMPBF::PrimitiveBlock* pb, int i )
+
+/*-------------------------------------------
+processDenseNodes()
+Takes a primitive block of dense nodes and
+parses the data to be stored in fullData
+--------------------------------------------*/
+void processDenseNodes( map< nodeId_t, node_t > &fullData, OSMPBF::PrimitiveBlock* pb, int i )
 {
 	//local variables
 	OSMPBF::DenseNodes dn = pb->primitivegroup( i ).dense();
-	long int id = 0;
-	double lon = 0;
-    double lat = 0;
-	double lon_offset = pb->lon_offset();;
-	double lat_offset = pb->lat_offset();;
-	double gran = pb->granularity();;
+	nodeId_t id = 0;
+	coord_t lon = 0;
+    coord_t lat = 0;
+	coord_t lon_offset = pb->lon_offset();;
+	coord_t lat_offset = pb->lat_offset();;
+	coord_t gran = pb->granularity();;
 	int nodeSize = 0;
 	int j = 0;
 	
@@ -194,15 +249,28 @@ void processDenseNodes( map< int, node_t > &mapData, OSMPBF::PrimitiveBlock* pb,
 		thisNode.id = id;
 		thisNode.lon = lon;
 		thisNode.lat = lat;
-		mapData[ id ] = thisNode;
+		fullData[ id ] = thisNode;
 	}
 }
 
+
+/*-------------------------------------------
+processHeaderBlock()
+Takes a blob of type OSMHeader. Currently
+unused
+--------------------------------------------*/
 bool processHeaderBlock( OSMPBF::Blob* b )
 {
     return true;
 }
 
+
+/*-----------------------------------------------
+inflateData()
+Takes a blob and decompresses blob->zlib_data
+and puts it in uncompressed. Blob->raw_size bytes
+are decompressed 
+-----------------------------------------------*/
 void inflateData( OSMPBF::Blob* b, unsigned char* uncompressed )
 {
 	//local variables
@@ -228,8 +296,37 @@ void inflateData( OSMPBF::Blob* b, unsigned char* uncompressed )
     if(inflateEnd(&z) != Z_OK) {
         cout << "failed to deinit zlib stream" << endl;
     }
+}
 
-	cout << "Total Out: " << z.total_out / 1024 << " KB" << endl;
+
+/*-------------------------------------------
+calculateDist()
+Calculates the distance on earth between
+two sets of coordinates. Distance is in km
+--------------------------------------------*/
+dist_t calculateDist(coord_t lat1, coord_t lon1, coord_t lat2, coord_t lon2)
+{
+    double lat1Rad = toRad( lat1 );
+	double lon1Rad = toRad( lon1 );
+    double lat2Rad = toRad( lat2 );
+	double lon2Rad = toRad( lon2 );
+	
+    double u = sin( ( lat2Rad - lat1Rad ) / 2 );
+    double v = sin( ( lon2Rad - lon1Rad ) / 2 );
+
+    double d = 2.0 * R * asin(sqrt(u * u + cos(lat1Rad) * cos(lat2Rad) * v * v));
+	
+    return d;
+}
+
+
+/*-------------------------------------------
+toRad()
+Convert degrees to radians
+--------------------------------------------*/
+double toRad( coord_t deg)
+{
+	return ( deg * PI / 180 );
 }
 
 

@@ -3,7 +3,7 @@ all: main
 main: main.o fileformat.pb.o osmformat.pb.o
 	g++ -o main main.o fileformat.pb.o osmformat.pb.o -lprotobuf -lz
 
-main.o: main.cpp
+main.o: main.cpp ../headers/osmParser.h
 	g++ -c -std=c++11 main.cpp
 
 fileformat.pb.o: ../headers/fileformat.pb.cc
