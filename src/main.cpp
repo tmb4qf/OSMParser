@@ -6,6 +6,18 @@
 #include <math.h>
 #include <chrono>
 #include <ctime>
+
+
+#include <bsoncxx/builder/stream/document.hpp>
+#include <bsoncxx/builder/stream/array.hpp>
+#include <bsoncxx/types.hpp>
+#include <bsoncxx/json.hpp>
+
+#include <mongocxx/client.hpp>
+#include <mongocxx/options/find.hpp>
+#include <mongocxx/instance.hpp>
+#include <mongocxx/uri.hpp>
+
 #include "../headers/fileformat.pb.h"
 #include "../headers/osmformat.pb.h"
 #include "../headers/osmParser.h"
@@ -35,8 +47,8 @@ int main( int argc, char* argv[] )
     OSMPBF::Blob blob;
     int i = 0;
 	map< nodeId_t, node_t > fullData;
-	map<nodeId_t, node_t> reducedData;
-	chrono::duration<double> time;
+	map< nodeId_t, node_t > reducedData;
+	chrono::duration<double> time1, time2;
 	chrono::time_point<chrono::system_clock> start, end;
 	
 	start = chrono::system_clock::now();
@@ -59,7 +71,8 @@ int main( int argc, char* argv[] )
         input.read( reinterpret_cast<char * >(blobBuffer), blobHeader.datasize() );
         blob.ParseFromArray( blobBuffer, blobHeader.datasize() );
 
-        cout << "I: " << i << endl;
+		if( i % 100 == 0)
+			cout << "Block: " << i << endl;
         i++;
 
         if( strcmp("OSMData", blobHeader.type().c_str()) == 0 )
@@ -73,17 +86,75 @@ int main( int argc, char* argv[] )
     } while( 1 );
 	
 	postProcessNodes( fullData, reducedData );
-	
 	end = chrono::system_clock::now();
-	time = end - start;
+	time1 = end - start;
 	
-	cout << endl <<"Blocks: " << i << endl;
-	cout << "Map Size: " << fullData.size() / 1000 << endl;
-	cout << "Reduced Size: " << reducedData.size() / 1000 << endl;
-	cout << "Time: " << time.count() << " seconds" << endl << endl;
+	start = chrono::system_clock::now();
+	bulkWriteToDB( reducedData );
+	end = chrono::system_clock::now();
+	time2 = end - start;
+	
     input.close();
     free(blobHeaderBuffer);
     free(blobBuffer);
+
+	cout << endl <<"Blocks: " << i << endl;
+	cout << "Map Size: " << fullData.size() / 1000 << "k" << endl;
+	cout << "Reduced Size: " << reducedData.size() / 1000 << "k" << endl << endl;
+	
+	
+	cout << "Parse time: " << time1.count() << " seconds" << endl;
+	cout << "Write time: " << time2.count() << " seconds" << endl << endl;
+}
+
+
+/*-------------------------------------------
+bulkWriteToDB()
+Connect to mongoDB on localhost and insert 
+data in a single bulk write
+--------------------------------------------*/
+bool bulkWriteToDB( map< nodeId_t, node_t > &data )
+{
+	using bsoncxx::builder::stream::document;
+	using bsoncxx::builder::stream::array;
+	using bsoncxx::builder::stream::finalize;
+	
+	cout << "Writing " << data.size() / 1000 << "k to DB..." << endl;
+	mongocxx::instance inst{};
+	mongocxx::uri uri{};
+	mongocxx::client conn{ mongocxx::uri{} };
+	
+	auto coll = conn["abc"]["osmStuff"];
+	coll.drop();
+	mongocxx::bulk_write bulk{};
+	
+	map<nodeId_t, node_t>::iterator node;
+	int j = 0;
+	for( node = data.begin(); node != data.end(); node++ )
+	{	
+		node_t* n = &node->second;
+		bsoncxx::builder::stream::document nodeDoc = document{};
+		nodeDoc << "id" << n->id << "lat" << n->lat << "lon" << n->lon;
+		
+		auto adjArr = array{};
+		for( j = 0; j < n->adj.size(); j++ )
+		{
+			auto adjDoc = document{};
+			adjDoc << "adj" << n->adj[j].first << "dist" << n->adj[j].second << finalize;
+			adjArr << bsoncxx::types::b_document{adjDoc.view()};
+		}
+		
+		nodeDoc << "adj" << bsoncxx::types::b_array{adjArr} << finalize;
+		mongocxx::model::insert_one op{nodeDoc.view()};
+		bulk.append(op);
+	}
+	
+	mongocxx::stdx::optional<mongocxx::result::bulk_write> result = coll.bulk_write(bulk);
+	
+	if( !result )
+        return false;
+	else if( result->inserted_count() == data.size() )
+		return true;
 }
 
 

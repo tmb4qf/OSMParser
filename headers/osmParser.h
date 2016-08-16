@@ -27,3 +27,4 @@ void processWays( map< nodeId_t, node_t > &fullData, OSMPBF::PrimitiveBlock* pb,
 void postProcessNodes( map< nodeId_t, node_t > &fullData, map< nodeId_t, node_t > &reducedData );
 dist_t calculateDist( coord_t lat1, coord_t lon1, coord_t lat2, coord_t lon2 );
 double toRad( coord_t deg );
+bool bulkWriteToDB( map< nodeId_t, node_t > &reducedData );
